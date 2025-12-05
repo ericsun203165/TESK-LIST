@@ -10,26 +10,33 @@ interface SettingsModalProps {
 
 const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onExportDB, onImportDB }) => {
   const [scriptUrl, setScriptUrl] = useState('');
+  const [calendarId, setCalendarId] = useState('');
   const [isCopied, setIsCopied] = useState(false);
 
   useEffect(() => {
-    const saved = localStorage.getItem('googleAppsScriptUrl');
-    if (saved) setScriptUrl(saved);
+    const savedUrl = localStorage.getItem('googleAppsScriptUrl');
+    const savedCalId = localStorage.getItem('googleCalendarId');
+    if (savedUrl) setScriptUrl(savedUrl);
+    if (savedCalId) setCalendarId(savedCalId);
   }, []);
 
   const handleSave = () => {
     localStorage.setItem('googleAppsScriptUrl', scriptUrl.trim());
+    localStorage.setItem('googleCalendarId', calendarId.trim());
     onClose();
   };
 
   const handleCopyCode = () => {
     const code = `/**
  * Google Apps Script for Smart Project Sync
- * v2.5: Added 'Actual Completed Date' Column
- * - Uses getDisplayValues() to read what you see (ignoring internal types)
- * - Removes ALL whitespace (spaces, tabs, invisible chars) for ID comparison
- * - Uses Hash Map for O(1) lookup accuracy
+ * v3.0: Permission Fix Edition
+ *
+ * ⚠️ IMPORTANT / 重要:
+ * After pasting this code, you MUST run the function 'testAuth' manually once
+ * in the editor to grant Calendar permissions!
+ * 貼上代碼後，請務必手動執行一次 'testAuth' 函數以開通權限！
  */
+
 function doPost(e) {
   var lock = LockService.getScriptLock();
   lock.tryLock(10000);
@@ -47,82 +54,143 @@ function doPost(e) {
 
     var action = data.action;
 
-    // --- ACTION: UPDATE SHEET ---
+    // --- ACTION: SHEET UPDATE (Generic) ---
     if (action === 'sheet') {
-      var ss = SpreadsheetApp.getActiveSpreadsheet();
-      var sheet = ss.getSheetByName("專案任務");
-      if (!sheet) {
-        sheet = ss.insertSheet("專案任務");
-        // Updated Header with '實際完成日'
-        sheet.appendRow(["編號", "交辦日期", "系統", "類別", "交辦人", "工作內容", "承辦人", "指定完成", "優先級", "進度", "狀態", "實際完成日"]);
-      }
-
-      var rowsToSync = data.rows; 
-      if (!rowsToSync || rowsToSync.length === 0) {
-        return ContentService.createTextOutput("No rows to sync");
-      }
-
-      // 2. Build ID Map from Existing Data
-      // We read ALL data as "Display Values" (String) to match what user sees
-      var lastRow = sheet.getLastRow();
-      var idMap = new Map(); // Key: Cleaned ID, Value: Row Index (1-based)
-
-      if (lastRow > 1) {
-        // Read Column A (IDs)
-        var values = sheet.getRange(2, 1, lastRow - 1, 1).getDisplayValues();
-        for (var i = 0; i < values.length; i++) {
-          var rawId = values[i][0];
-          // Clean ID: Remove all whitespace/invisible chars
-          var cleanId = rawId.toString().replace(/\s/g, "");
-          if (cleanId && !idMap.has(cleanId)) {
-             idMap.set(cleanId, i + 2); // Store 1-based row index
-          }
-        }
-      }
-
-      // 3. Process Incoming Rows
-      rowsToSync.forEach(function(row) {
-        var rawInputId = row[0];
-        // Same cleaning for input ID
-        var cleanInputId = rawInputId.toString().replace(/\s/g, "");
-
-        if (idMap.has(cleanInputId)) {
-          // UPDATE Existing Row
-          var rowIndex = idMap.get(cleanInputId);
-          // Update the range with the new data. 
-          // Note: If the new data has more columns (e.g. Actual Date), it will expand.
-          sheet.getRange(rowIndex, 1, 1, row.length).setValues([row]);
-        } else {
-          // APPEND New Row
-          sheet.appendRow(row);
-          // Add to map to handle duplicates within the same batch
-          idMap.set(cleanInputId, sheet.getLastRow()); 
-        }
-      });
-
-      return ContentService.createTextOutput("Synced " + rowsToSync.length + " rows (v2.5)");
+       return handleSheetUpdate(data.rows);
     }
 
-    // --- ACTION: CALENDAR ---
+    // --- ACTION: CALENDAR (Generic) ---
     else if (action === 'calendar') {
-      var title = data.title;
-      var dateStr = data.date;
-      var description = data.description;
-      
-      if (title && dateStr) {
-        var cal = CalendarApp.getDefaultCalendar();
-        cal.createAllDayEvent(title, new Date(dateStr), { description: description });
-        return ContentService.createTextOutput("Event Created");
-      }
+       return handleCalendarCreate(data);
+    }
+
+    // --- ACTION: SMART SYNC (Sheet + Calendar in one Go) ---
+    else if (action === 'add_task_smart') {
+       var sheetResult = handleSheetUpdate([data.sheetRow]);
+       var calResult = "Skipped";
+       
+       if (data.calendarData) {
+         calResult = handleCalendarCreate(data.calendarData);
+       }
+       
+       return ContentService.createTextOutput("Smart Sync: " + sheetResult.getContent() + " | Calendar: " + calResult.getContent());
     }
 
     return ContentService.createTextOutput("Unknown Action");
 
   } catch (err) {
+    // Write error to sheet if possible so user sees it
+    try {
+      var ss = SpreadsheetApp.getActiveSpreadsheet();
+      var sheet = ss.getSheetByName("專案任務");
+      if(sheet) sheet.appendRow(["ERROR LOG", new Date(), err.toString()]);
+    } catch(e) {}
+    
     return ContentService.createTextOutput("Error: " + err.toString());
   } finally {
     lock.releaseLock();
   }
+}
+
+/**
+ * ⚠️ 關鍵函數：請手動執行此函數一次以授權權限 ⚠️
+ * ⚠️ RUN THIS FUNCTION MANUALLY ONCE TO AUTHORIZE PERMISSIONS ⚠️
+ */
+function testAuth() {
+  console.log("Requesting permissions...");
+  // This lines force Google to ask for Calendar & Sheet permissions
+  CalendarApp.getDefaultCalendar();
+  SpreadsheetApp.getActiveSpreadsheet();
+  console.log("Permissions granted! You can now Deploy.");
+}
+
+// --- HELPER FUNCTIONS ---
+
+function handleSheetUpdate(rowsToSync) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName("專案任務");
+  if (!sheet) {
+    sheet = ss.insertSheet("專案任務");
+    sheet.appendRow(["編號", "交辦日期", "系統", "類別", "交辦人", "工作內容", "承辦人", "指定完成", "優先級", "進度", "狀態", "實際完成日"]);
+  }
+
+  if (!rowsToSync || rowsToSync.length === 0) {
+    return ContentService.createTextOutput("No rows to sync");
+  }
+
+  var lastRow = sheet.getLastRow();
+  var idMap = new Map();
+
+  if (lastRow > 1) {
+    // getDisplayValues reads what user sees (avoiding date object or number issues)
+    var values = sheet.getRange(2, 1, lastRow - 1, 1).getDisplayValues();
+    for (var i = 0; i < values.length; i++) {
+      var rawId = values[i][0];
+      // Regex remove all spaces to ensure "1205-1 " equals "1205-1"
+      var cleanId = rawId.toString().replace(/\\s/g, "");
+      if (cleanId && !idMap.has(cleanId)) {
+         idMap.set(cleanId, i + 2); // Store row number (1-based)
+      }
+    }
+  }
+
+  rowsToSync.forEach(function(row) {
+    var rawInputId = row[0];
+    var cleanInputId = rawInputId.toString().replace(/\\s/g, "");
+
+    if (idMap.has(cleanInputId)) {
+      var rowIndex = idMap.get(cleanInputId);
+      sheet.getRange(rowIndex, 1, 1, row.length).setValues([row]);
+    } else {
+      sheet.appendRow(row);
+      idMap.set(cleanInputId, sheet.getLastRow()); 
+    }
+  });
+
+  return ContentService.createTextOutput("Synced " + rowsToSync.length + " rows");
+}
+
+function handleCalendarCreate(data) {
+    var rawTitle = data.title;
+    var dateStr = data.date; // YYYY-MM-DD
+    var description = data.description;
+    var calId = data.calendarId ? data.calendarId.trim() : "";
+    
+    if (!rawTitle || !dateStr) return ContentService.createTextOutput("Missing Title or Date");
+
+    var title = "[專案任務] " + rawTitle;
+    var cal;
+    var logMsg = "";
+
+    // 1. Try Specific Calendar ID if provided
+    if (calId) {
+        try {
+            cal = CalendarApp.getCalendarById(calId);
+            if (!cal) {
+                logMsg += "Specific Cal ID not found/accessible. ";
+                throw new Error("Calendar not found");
+            }
+        } catch(e) {
+            // 2. Fallback to Default
+            cal = CalendarApp.getDefaultCalendar();
+            title += " (Backup)";
+            logMsg += "Fallback to Default (" + e.toString() + "). ";
+        }
+    } else {
+        cal = CalendarApp.getDefaultCalendar();
+    }
+
+    if (cal) {
+        // Fix Timezone: Parse YYYY-MM-DD manually
+        var parts = dateStr.split('-');
+        var dateObj = new Date(parts[0], parts[1] - 1, parts[2]);
+
+        cal.createAllDayEvent(title, dateObj, { description: description });
+        
+        return ContentService.createTextOutput("Success: " + title + ". " + logMsg);
+    } else {
+        return ContentService.createTextOutput("Error: No Calendar available.");
+    }
 }`;
     navigator.clipboard.writeText(code);
     setIsCopied(true);
@@ -186,20 +254,21 @@ function doPost(e) {
             
             <div className="space-y-4">
                 <h4 className="text-sm font-bold text-slate-700">步驟 1: 更新並部署 Google Apps Script</h4>
-                <div className="bg-yellow-50 border-l-4 border-yellow-400 p-3 mb-2 text-xs text-yellow-700">
-                    <strong>更新提示 (v2.5)：</strong> 新增了「實際完成日」欄位支援。請重新部署！
+                <div className="bg-red-50 border-l-4 border-red-400 p-3 mb-2 text-xs text-red-700">
+                    <strong>⚠️ 權限修復 (v3.0)：</strong> 為了啟用行事曆，貼上代碼後，您必須在編輯器上方選單選擇 <code>testAuth</code> 函數並按 <strong>「執行 (Run)」</strong>，才能觸發 Google 的授權視窗！
                 </div>
                 <ol className="list-decimal list-inside text-sm text-slate-600 space-y-2 ml-2">
                 <li>開啟您的 Google Sheet，點選上方選單 <strong>擴充功能 &gt; Apps Script</strong>。</li>
                 <li>
-                    複製下方 <strong>新版 v2.5</strong> 程式碼並覆蓋編輯器內容：
+                    複製下方 <strong>新版 v3.0</strong> 程式碼並覆蓋編輯器內容：
                     <button 
                     onClick={handleCopyCode}
                     className="ml-2 px-2 py-0.5 text-xs bg-slate-200 hover:bg-slate-300 rounded text-slate-700 transition-colors"
                     >
-                    {isCopied ? '已複製！' : '複製新版程式碼 (v2.5)'}
+                    {isCopied ? '已複製！' : '複製新版程式碼 (v3.0)'}
                     </button>
                 </li>
+                <li><strong>手動執行：</strong> 在編輯器上方下拉選單選 <code>testAuth</code>，按執行，並允許權限。</li>
                 <li>點選 <strong>部署 &gt; 管理部署作業</strong>。</li>
                 <li>點擊上方 <strong>筆(編輯)</strong> 圖示，版本選擇 <strong>「建立新版本」</strong>。</li>
                 <li>點選部署。</li>
@@ -213,8 +282,18 @@ function doPost(e) {
                 value={scriptUrl}
                 onChange={(e) => setScriptUrl(e.target.value)}
                 placeholder="https://script.google.com/macros/s/..."
+                className="w-full p-3 bg-white border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 mb-3"
+                />
+
+                <label className="block text-sm font-medium text-slate-700 mb-2">步驟 3: Google 行事曆 ID (選填)</label>
+                <input 
+                type="text" 
+                value={calendarId}
+                onChange={(e) => setCalendarId(e.target.value)}
+                placeholder="例如: xxxx@group.calendar.google.com"
                 className="w-full p-3 bg-white border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
                 />
+                <p className="text-xs text-slate-500 mt-1">若留空或權限不足，系統將自動寫入您的預設行事曆並標註 (Backup)。</p>
             </div>
           </div>
 

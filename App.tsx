@@ -7,6 +7,8 @@ import SettingsModal from './components/SettingsModal';
 import { Task, Priority, ProcessingStatus, ParsedTaskResponse, TaskStatus, TASK_CATEGORIES, SYSTEM_OPTIONS, ReportEntry } from './types';
 
 const DEFAULT_SHEET_URL = "https://docs.google.com/spreadsheets/d/195o6B-ZeKl2Y69LZ73OWqUnnhL0ZitarwFLcg4oNxR8/edit?usp=sharing";
+// Default Calendar ID provided by user
+const DEFAULT_CALENDAR_ID = "1ef220aa9770f3738162fe1255d94a6501f60636cdf96f7c2726de279c385f4e@group.calendar.google.com";
 
 export default function App() {
   const [tasks, setTasks] = useState<Task[]>([]);
@@ -51,6 +53,11 @@ export default function App() {
       setGoogleSheetUrl(savedUrl);
     } else {
       localStorage.setItem('googleSheetUrl', DEFAULT_SHEET_URL);
+    }
+
+    // Initialize Calendar ID if not set
+    if (!localStorage.getItem('googleCalendarId')) {
+        localStorage.setItem('googleCalendarId', DEFAULT_CALENDAR_ID);
     }
   }, []);
 
@@ -224,7 +231,7 @@ export default function App() {
   const overdueCount = tasks.filter(t => getTaskDueStatus(t.targetDate, t.status) === 'overdue').length;
   const dueSoonCount = tasks.filter(t => getTaskDueStatus(t.targetDate, t.status) === 'due-soon').length;
 
-  // --- Sheet Sync Logic (Hoisted) ---
+  // --- Sheet Sync Logic ---
   const formatTaskForSheet = (task: Task) => {
     // 欄位: 編號, 交辦日期, 系統, 類別, 交辦人, 工作內容, 承辦人, 指定完成, 優先級, 進度%, 狀態, 實際完成
     const cols = [
@@ -324,6 +331,146 @@ export default function App() {
     }
   };
 
+  const handleSyncCalendar = async (task: Task, isSilent = false) => {
+      const scriptUrl = localStorage.getItem('googleAppsScriptUrl');
+      const calendarId = localStorage.getItem('googleCalendarId') || DEFAULT_CALENDAR_ID;
+      
+      if (!task.targetDate) {
+          if (!isSilent) alert("請先設定「指定完成日」才能加入行事曆。");
+          return;
+      }
+
+      if (scriptUrl) {
+          if(!scriptUrl.includes('script.google.com')) {
+            if (!isSilent) alert('Apps Script 網址格式不正確，請檢查設定。');
+            return;
+          }
+
+          if (!isSilent) setStatus({ isProcessing: true, message: '正在同步到行事曆...' });
+          try {
+            const payload = JSON.stringify({ 
+                action: 'calendar',
+                calendarId: calendarId, // Pass the specific Calendar ID
+                title: `[${task.system}] ${task.content} - ${task.assignee}`,
+                date: task.targetDate,
+                description: `編號: ${task.taskNumber}\n系統: ${task.system}\n交辦人: ${task.assigner}\n內容: ${task.content}\n優先級: ${task.priority}`
+            });
+
+            await fetch(scriptUrl, {
+                method: 'POST',
+                mode: 'no-cors',
+                 headers: {
+                  'Content-Type': 'application/x-www-form-urlencoded',
+                },
+                body: new URLSearchParams({ payload }).toString()
+            });
+            
+            setTasks(prev => prev.map(t => t.id === task.id ? { ...t, syncedCalendar: true } : t));
+            if (!isSilent) alert("已發送行事曆建立請求！");
+          } catch (e) {
+              console.error(e);
+              if (!isSilent) alert("同步行事曆失敗。");
+          } finally {
+              if (!isSilent) setStatus({ isProcessing: false, message: '' });
+          }
+      } 
+      else {
+        // Fallback to Web Link (Manual)
+        if (isSilent) return; // Silent mode only works with Script
+
+        const title = encodeURIComponent(`[${task.system}] ${task.content} - ${task.assignee}`);
+        const details = encodeURIComponent(`編號: ${task.taskNumber}\n系統: ${task.system}\n交辦人: ${task.assigner}\n內容: ${task.content}`);
+        const dateStr = task.targetDate.replace(/-/g, '');
+        const dates = `${dateStr}/${dateStr}`;
+
+        const calendarUrl = `https://calendar.google.com/calendar/render?action=TEMPLATE&text=${title}&details=${details}&dates=${dates}`;
+        
+        window.open(calendarUrl, '_blank');
+        setTasks(prev => prev.map(t => t.id === task.id ? { ...t, syncedCalendar: true } : t));
+      }
+  };
+
+  // v2.7 Smart Sync: Combines Sheet & Calendar in one request
+  const handleSmartSync = async (task: Task, isSilent = false) => {
+    const scriptUrl = localStorage.getItem('googleAppsScriptUrl');
+    const calendarId = localStorage.getItem('googleCalendarId') || DEFAULT_CALENDAR_ID;
+    
+    if (!scriptUrl || !scriptUrl.includes('script.google.com')) {
+        // Fallback to clipboard/individual sync if no valid script
+        await handleSyncSheet(task, isSilent);
+        if (task.targetDate) await handleSyncCalendar(task, isSilent);
+        return;
+    }
+
+    if (!isSilent) setStatus({ isProcessing: true, message: '正在同步資料到 Google Sheet 與 行事曆...' });
+
+    // Prepare Sheet Data
+    const rowData = [
+      task.taskNumber,
+      task.assignedDate.replace(/-/g, '/'),
+      task.system,
+      task.category,
+      task.assigner,
+      task.content,
+      task.assignee,
+      task.targetDate ? task.targetDate.replace(/-/g, '/') : '',
+      task.priority,
+      `${task.progress}%`,
+      task.status,
+      task.actualCompletedDate ? task.actualCompletedDate.replace(/-/g, '/') : ''
+    ];
+
+    try {
+        const payload: any = {
+            action: 'add_task_smart',
+            sheetRow: rowData,
+        };
+
+        // Add Calendar Data if targetDate exists
+        if (task.targetDate) {
+            payload.calendarData = {
+                calendarId: calendarId,
+                title: `[${task.system}] ${task.content} - ${task.assignee}`,
+                date: task.targetDate,
+                description: `編號: ${task.taskNumber}\n系統: ${task.system}\n交辦人: ${task.assigner}\n內容: ${task.content}\n優先級: ${task.priority}`
+            };
+        }
+
+        await fetch(scriptUrl, {
+            method: 'POST',
+            mode: 'no-cors',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({ payload: JSON.stringify(payload) }).toString()
+        });
+
+        // Update local status
+        setTasks(prev => prev.map(t => t.id === task.id ? { 
+            ...t, 
+            syncedSheet: true, 
+            syncedCalendar: !!task.targetDate 
+        } : t));
+
+        if (!isSilent) alert("同步成功！");
+
+    } catch (e) {
+        console.error(e);
+        if (!isSilent) alert("同步失敗，請檢查網路。");
+    } finally {
+        if (!isSilent) setStatus({ isProcessing: false, message: '' });
+    }
+  };
+
+  const generateTaskNumber = () => {
+    const today = new Date();
+    const mm = String(today.getMonth() + 1).padStart(2, '0');
+    const dd = String(today.getDate()).padStart(2, '0');
+    const prefix = `${mm}${dd}`;
+    const dailyCount = tasks.filter(t => t.taskNumber.startsWith(prefix)).length + 1;
+    // Add a short random hash (3 chars) to ensure uniqueness even if daily counts overlap or reset
+    const hash = Math.random().toString(36).substring(2, 5).toUpperCase();
+    return `${prefix}-${dailyCount}-${hash}`;
+  };
+
   const handleAddTask = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     if (!inputValue.trim()) return;
@@ -367,8 +514,9 @@ export default function App() {
         setTasks(prev => [newTask, ...prev]);
         setInputValue('');
 
-        // Auto Sync silently
-        handleSyncSheet(newTask, true);
+        // Use v2.7 Smart Sync (Atomic Update)
+        setStatus({ isProcessing: true, message: '正在同步到 Google Sheet 與 行事曆...' });
+        await handleSmartSync(newTask, true);
 
       } else {
         setError('無法辨識內容，請嘗試更完整的描述。');
@@ -379,15 +527,6 @@ export default function App() {
     } finally {
       setStatus({ isProcessing: false, message: '' });
     }
-  };
-
-  const generateTaskNumber = () => {
-    const today = new Date();
-    const mm = String(today.getMonth() + 1).padStart(2, '0');
-    const dd = String(today.getDate()).padStart(2, '0');
-    const prefix = `${mm}${dd}`;
-    const dailyCount = tasks.filter(t => t.taskNumber.startsWith(prefix)).length + 1;
-    return `${prefix}-${dailyCount}`;
   };
 
   const handleUpdateTask = (id: string, field: keyof Task, value: any) => {
@@ -477,65 +616,6 @@ export default function App() {
     } else {
       setSelectedTaskIds(new Set());
     }
-  };
-
-  const handleSyncCalendar = async (task: Task) => {
-      const scriptUrl = localStorage.getItem('googleAppsScriptUrl');
-      
-      if (scriptUrl) {
-          if (!task.targetDate) {
-              alert("請先設定「指定完成日」才能加入行事曆。");
-              return;
-          }
-
-          if(!scriptUrl.includes('script.google.com')) {
-            alert('Apps Script 網址格式不正確，請檢查設定。');
-            return;
-          }
-
-          setStatus({ isProcessing: true, message: '正在同步到行事曆...' });
-          try {
-            const payload = JSON.stringify({ 
-                action: 'calendar',
-                title: `[${task.system}] ${task.content} - ${task.assignee}`,
-                date: task.targetDate,
-                description: `編號: ${task.taskNumber}\n系統: ${task.system}\n交辦人: ${task.assigner}\n內容: ${task.content}`
-            });
-
-            await fetch(scriptUrl, {
-                method: 'POST',
-                mode: 'no-cors',
-                 headers: {
-                  'Content-Type': 'application/x-www-form-urlencoded',
-                },
-                body: new URLSearchParams({ payload }).toString()
-            });
-            
-            setTasks(prev => prev.map(t => t.id === task.id ? { ...t, syncedCalendar: true } : t));
-            alert("已發送行事曆建立請求！");
-          } catch (e) {
-              console.error(e);
-              alert("同步行事曆失敗。");
-          } finally {
-              setStatus({ isProcessing: false, message: '' });
-          }
-      } 
-      else {
-        if (!task.targetDate) {
-            alert("請先設定「指定完成日」才能加入行事曆。");
-            return;
-        }
-
-        const title = encodeURIComponent(`[${task.system}] ${task.content} - ${task.assignee}`);
-        const details = encodeURIComponent(`編號: ${task.taskNumber}\n系統: ${task.system}\n交辦人: ${task.assigner}\n內容: ${task.content}`);
-        const dateStr = task.targetDate.replace(/-/g, '');
-        const dates = `${dateStr}/${dateStr}`;
-
-        const calendarUrl = `https://calendar.google.com/calendar/render?action=TEMPLATE&text=${title}&details=${details}&dates=${dates}`;
-        
-        window.open(calendarUrl, '_blank');
-        setTasks(prev => prev.map(t => t.id === task.id ? { ...t, syncedCalendar: true } : t));
-      }
   };
 
   const handleExportList = () => {
