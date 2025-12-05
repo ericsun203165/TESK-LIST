@@ -1,0 +1,5 @@
+{
+  "name": "Gemini Smart Task Sync",
+  "description": "A smart task manager that uses Gemini to parse natural language into structured tasks, simulating integration with Google Calendar and Sheets via intelligent data formatting and file exports.",
+  "requestFramePermissions": []
+}
